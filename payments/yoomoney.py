@@ -7,6 +7,7 @@ from dotenv import load_dotenv
 import os
 import logging
 from database.db import reactivate_xui_account
+from aiogram import Bot
 
 load_dotenv()
 
