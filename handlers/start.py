@@ -1,132 +1,177 @@
-from aiogram import Router
-from aiogram.filters import Command
-from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram.filters.callback_data import CallbackData
-from aiogram.enums import ParseMode
-from datetime import datetime
-from database.db import register_user, get_user_status, simulate_trial_end
-from payments.yoomoney import create_payment_url
+from aiogram import Router, F
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.filters import CommandStart, Command
+from database.db import init_user, check_subscription
+from payments.yoomoney import create_payment_url  # type: ignore
+import logging
+import os
+from dotenv import load_dotenv
+from datetime import datetime, timezone, timedelta
+
+load_dotenv()
 
 router = Router()
 
-# Определение тарифов
-TARIFFS = {
-    "month": {"name": "1 месяц", "price": 500, "days": 30}
-    # Другие тарифы можно добавить, раскомментировав:
-    # "quarter": {"name": "3 месяца", "price": 1200, "days": 90},
-    # "year": {"name": "1 год", "price": 5000, "days": 365}
-}
+# Парсим тарифы из .env
+TARIFFS = []
+try:
+    tariff_str = os.getenv("TARIFFS", "30:500,90:1200,180:2000")
+    for tariff in tariff_str.split(","):
+        days, price = tariff.split(":")
+        days = int(days)
+        price = float(price)
+        if days <= 0 or price <= 0:
+            raise ValueError(f"Invalid tariff: days={days}, price={price}")
+        TARIFFS.append({"days": days, "price": price})
+    logging.info(f"Loaded tariffs: {TARIFFS}")
+except ValueError as e:
+    logging.error(f"Invalid TARIFFS format in .env: {e}")
+    TARIFFS = [{"days": 30, "price": 500}, {"days": 90, "price": 1200}, {"days": 180, "price": 2000}]
 
 
-class TariffCallback(CallbackData, prefix="buy"):
-    tariff: str
-
-
-@router.message(Command("start"))
+@router.message(CommandStart())
 async def cmd_start(message: Message):
-    # Регистрируем пользователя
-    username = message.from_user.username or "unknown"
-    result = await register_user(message.from_user.id, username)
+    user_id = message.from_user.id
+    subscription_status, subscription_end = await check_subscription(user_id)
 
-    # Проверяем статус подписки
-    user_status = await get_user_status(message.from_user.id)
-    if not user_status:
-        await message.answer("Ошибка: пользователь не найден.")
-        return
+    if subscription_status is None:
+        await init_user(user_id)
+        subscription_status = "trial"
+        subscription_end = (datetime.now(timezone.utc) + timedelta(days=7)).isoformat()
+        logging.info(f"Registered user {user_id} with trial period")
 
-    status = user_status["status"]
-    end_date = user_status["end_date"]
-    vpn_config = user_status["vpn_config"]
-    days_left = (end_date - datetime.now()).days if status != "expired" else 0
-
-    # Формируем сообщение
-    if isinstance(result, tuple) and result[0]:  # Новый пользователь
-        msg = (
-            "**Добро пожаловать!**\n"
-            "Вы получили бесплатный пробный период на 3 дня.\n\n"
-            "**Ваша конфигурация VPN** (скопируйте строку):\n"
-            f"```{vpn_config}```"
-        )
-    elif status == "trial":
-        msg = (
-            "**Ваш пробный период активен**\n"
-            f"Осталось: {days_left} дней\n\n"
-            "**Ваша конфигурация VPN** (скопируйте строку):\n"
-            f"```{vpn_config}```"
-        )
-    elif status == "active":
-        msg = (
-            "**Ваша подписка активна**\n"
-            f"Осталось: {days_left} дней\n\n"
-            "**Ваша конфигурация VPN** (скопируйте строку):\n"
-            f"```{vpn_config}```"
-        )
+    text = (
+        f"**Добро пожаловать!**\n"
+        f"Ваш статус подписки: {'Пробный' if subscription_status == 'trial' else 'Активна' if subscription_status == 'active' else 'Неактивна'}\n"
+    )
+    if subscription_status in ("active", "trial") and subscription_end:
+        try:
+            end_date = datetime.fromisoformat(subscription_end.replace("Z", "+00:00"))
+            days_left = (end_date - datetime.now(timezone.utc)).days
+            if days_left >= 0:
+                text += f"Подписка активна ещё {days_left} дней\n"
+            else:
+                text += "Подписка истекла\n"
+        except ValueError as e:
+            logging.error(f"Invalid subscription_end format for user {user_id}: {e}")
+            text += "Ошибка в дате подписки\n"
     else:
-        msg = (
-            "**Ваш пробный период истёк**\n"
-            "Оформите подписку, чтобы продолжить.\n\n"
-            "**Ваша конфигурация VPN** (неактивна, скопируйте для последующего использования):\n"
-            f"```{vpn_config}```"
-        )
+        text += "Подписка неактивна\n"
 
-    # Добавляем кнопку "Купить VPN"
+    text += "\nНажмите кнопку ниже, чтобы купить или продлить подписку."
+
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Купить VPN", callback_data="show_tariffs")]
+        [InlineKeyboardButton(text="Купить VPN", callback_data="buy_vpn")]
     ])
-    await message.answer(
-        f"{msg}\n\n**Действия**: Нажмите кнопку ниже, чтобы купить или продлить подписку:",
-        reply_markup=keyboard,
-        parse_mode=ParseMode.MARKDOWN
-    )
 
-
-@router.callback_query(lambda c: c.data == "show_tariffs")
-async def show_tariffs(callback_query):
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"{TARIFFS['month']['name']} ({TARIFFS['month']['price']} руб)",
-                              callback_data=TariffCallback(tariff="month").pack())]
-        # Другие тарифы можно добавить, раскомментировав:
-        # [InlineKeyboardButton(text=f"{TARIFFS['quarter']['name']} ({TARIFFS['quarter']['price']} руб)", callback_data=TariffCallback(tariff="quarter").pack())],
-        # [InlineKeyboardButton(text=f"{TARIFFS['year']['name']} ({TARIFFS['year']['price']} руб)", callback_data=TariffCallback(tariff="year").pack())]
-    ])
-    await callback_query.message.answer("**Выберите тариф**:", reply_markup=keyboard, parse_mode=ParseMode.MARKDOWN)
-    await callback_query.answer()
-
-
-@router.callback_query(TariffCallback.filter())
-async def process_tariff_selection(callback_query, callback_data: TariffCallback):
-    tariff = callback_data.tariff
-    if tariff not in TARIFFS:
-        await callback_query.message.answer("Ошибка: выбранный тариф недоступен.")
-        return
-
-    # Создаём платёжную ссылку
-    payment_url = create_payment_url(
-        user_id=callback_query.from_user.id,
-        amount=TARIFFS[tariff]["price"],
-        tariff_days=TARIFFS[tariff]["days"]
-    )
-
-    await callback_query.message.answer(
-        f"**Оплатите подписку**\n"
-        f"Тариф: {TARIFFS[tariff]['name']} за {TARIFFS[tariff]['price']} руб.\n"
-        f"Перейдите по ссылке для оплаты:\n{payment_url}\n\n"
-        "После оплаты используйте /check_payment для проверки статуса.",
-        parse_mode=ParseMode.MARKDOWN
-    )
-    await callback_query.answer()
-
-
-@router.message(Command("simulate_trial_end"))
-async def cmd_simulate_trial_end(message: Message):
-    success = await simulate_trial_end(message.from_user.id)
-    if not success:
-        await message.answer("Ошибка: пользователь не найден.")
-        return
-    await message.answer("Триальный период завершён. Проверьте статус с помощью /start.")
+    await message.answer(text, parse_mode="Markdown", reply_markup=keyboard)
 
 
 @router.message(Command("check_payment"))
 async def cmd_check_payment(message: Message):
-    # Временная заглушка, позже интегрируем проверку через базу данных
-    await message.answer("Проверка оплаты пока не реализована. Ожидайте уведомления от бота после оплаты.")
+    user_id = message.from_user.id
+    subscription_status, subscription_end = await check_subscription(user_id)
+
+    if subscription_status == "active" and subscription_end:
+        try:
+            end_date = datetime.fromisoformat(subscription_end.replace("Z", "+00:00"))
+            days_left = (end_date - datetime.now(timezone.utc)).days
+            if days_left >= 0:
+                await message.answer(
+                    f"**Подписка активна!**\nОсталось {days_left} дней.",
+                    parse_mode="Markdown"
+                )
+            else:
+                await message.answer(
+                    "Подписка истекла. Пожалуйста, продлите подписку.",
+                    parse_mode="Markdown"
+                )
+        except ValueError as e:
+            logging.error(f"Invalid subscription_end format for user {user_id}: {e}")
+            await message.answer("Ошибка в дате подписки.")
+    else:
+        await message.answer("Подписка неактивна. Пожалуйста, оплатите подписку.")
+
+
+@router.callback_query(F.data == "buy_vpn")
+async def process_buy_vpn(callback_query: CallbackQuery):
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text=f"{tariff['days']} дней ({tariff['price']} руб)",
+            callback_data=f"tariff_{tariff['days']}_{tariff['price']}"
+        )] for tariff in TARIFFS
+    ])
+
+    await callback_query.message.answer(
+        "Выберите тарифный план:",
+        reply_markup=keyboard
+    )
+    await callback_query.answer()
+
+
+@router.callback_query(F.data.startswith("tariff_"))
+async def process_tariff_selection(callback_query: CallbackQuery):
+    user_id = callback_query.from_user.id
+    tariff_data = callback_query.data.split("_")
+    tariff_days = int(tariff_data[1])
+    amount = float(tariff_data[2])
+
+    tariff_name = {
+        30: "1 месяц",
+        90: "3 месяца",
+        180: "6 месяцев"
+    }.get(tariff_days, f"{tariff_days} дней")
+
+    payment_url = create_payment_url(user_id, amount, tariff_days)
+    logging.info(f"Generated payment URL for user {user_id}: {payment_url}")
+
+    await callback_query.message.answer(
+        f"**Оплатите подписку**\nТариф: {tariff_name} за {amount} руб.",
+        parse_mode="Markdown"
+    )
+
+    text = (
+        f"Перейдите по ссылке для оплаты:\n{payment_url}\n\n"
+        f"После оплаты нажмите кнопку ниже для проверки."
+    )
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Оплатить", url=payment_url)],
+        [InlineKeyboardButton(text="Проверить оплату", callback_data="check_payment")]
+    ])
+
+    logging.info(f"Sending message to user {user_id}: {text}")
+
+    await callback_query.message.answer(
+        text=text,
+        parse_mode=None,
+        reply_markup=keyboard,
+        disable_web_page_preview=True
+    )
+    await callback_query.answer()
+
+
+@router.callback_query(F.data == "check_payment")
+async def process_check_payment(callback_query: CallbackQuery):
+    user_id = callback_query.from_user.id
+    subscription_status, subscription_end = await check_subscription(user_id)
+
+    if subscription_status == "active" and subscription_end:
+        try:
+            end_date = datetime.fromisoformat(subscription_end.replace("Z", "+00:00"))
+            days_left = (end_date - datetime.now(timezone.utc)).days
+            if days_left >= 0:
+                await callback_query.message.answer(
+                    f"**Подписка активна!**\nОсталось {days_left} дней.",
+                    parse_mode="Markdown"
+                )
+            else:
+                await callback_query.message.answer(
+                    "Подписка истекла. Пожалуйста, продлите подписку.",
+                    parse_mode="Markdown"
+                )
+        except ValueError as e:
+            logging.error(f"Invalid subscription_end format for user {user_id}: {e}")
+            await callback_query.message.answer("Ошибка в дате подписки.")
+    else:
+        await callback_query.message.answer("Подписка неактивна. Пожалуйста, оплатите подписку.")
+    await callback_query.answer()
